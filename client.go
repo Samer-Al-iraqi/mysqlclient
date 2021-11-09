@@ -5,8 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
-	"go/lib/misc"
-	"go/lib/myhtml"
+	"html"
 	"io"
 	"net"
 	"strconv"
@@ -17,22 +16,16 @@ import (
 const socket = "/run/mysqld/mysqld.sock"
 const packetSize = 16777215
 
-type LastQueryInfo struct {
-	Time        time.Time
-	Query       []byte
-	buf         []byte
-	ColumnsInfo []ColumnInfo
-}
 type Session struct {
 	conn net.Conn
 	*payloadBuf
-	Queries         uint64
-	LastQueryBuffer []byte
-	LastQuery       []byte
-	LastQueryTime   time.Time
-	Created         time.Time
-	lastReset       int64
-	isDead          bool
+	Queries       uint64
+	LastQuery     []byte
+	LastQueryTime time.Time
+	Created       time.Time
+	lastReset     int64
+	isDead        bool
+	onGoingQuery  bool
 }
 type DbinfoT struct {
 	dbName      []byte
@@ -149,12 +142,13 @@ func (info *DbinfoT) NewSesstion() (sess *Session) {
 
 const WaitTimeoutSec = 62
 
-var initConnCommand = "SET SESSION transaction_isolation='READ-COMMITTED', sql_mode='STRICT_ALL_TABLES', sql_safe_updates=1, sql_select_limit=10000, wait_timeout=" + misc.IntToStr(WaitTimeoutSec)
+var initConnCommand = "SET SESSION transaction_isolation='READ-COMMITTED', sql_mode='STRICT_ALL_TABLES', sql_safe_updates=1, sql_select_limit=10000, wait_timeout=" + strconv.Itoa(WaitTimeoutSec)
 
 func initConn(sess *Session) {
 	sess.TextCommand(initConnCommand)
 }
 
+// Insert single row in database
 func (sess *Session) Insert(table string, data map[string]interface{}) (insertedId uint) {
 	dataLen := len(data)
 	args := make([]interface{}, dataLen)
@@ -176,7 +170,20 @@ func (sess *Session) Insert(table string, data map[string]interface{}) (inserted
 	ok := sess.Exec(w.String(), args...)
 	return ok.Inserted
 }
-func (sess *Session) Update(table string, data map[string]interface{}, whereCol string, whereCond interface{}) (updated uint) {
+
+// update db row(s) based on condition (single where column and single whereValue)
+/*
+	sess.Update(
+		"users",
+		map[string]interface{}{
+			"lastPostUnix": time.Now().Unix()
+		},
+		"userid",
+		10,
+	)
+*/
+func (sess *Session) Update(table string, data map[string]interface{}, whereCol string, whereValue interface{}) (updated uint) {
+
 	dataLen := len(data)
 	if dataLen == 0 {
 		return 0
@@ -200,32 +207,84 @@ func (sess *Session) Update(table string, data map[string]interface{}, whereCol 
 	w.WriteString("\nWHERE ")
 	w.WriteString(whereCol)
 	w.WriteString("=?")
-	args = append(args, whereCond)
+	args = append(args, whereValue)
 	ok := sess.Exec(w.String(), args...)
 	return ok.Affected
 }
+
+// Delete row(s) based on condition
 func (sess *Session) Delete(table string, where string, args ...interface{}) uint {
 	ok := sess.Exec("DELETE FROM "+table+" WHERE "+where, args...)
 	return ok.Affected
 }
 
+// Begin transaction
 func (sess *Session) Begin() {
 	sess.TextCommand("Begin")
 }
+
+// Commit transaction
 func (sess *Session) Commit() {
 	sess.TextCommand("Commit")
 }
+
+// Rollback transaction
 func (sess *Session) Rollback() {
 	sess.TextCommand("ROLLBACK")
 }
-func (sess *Session) CountRows(table, string, where string, args ...interface{}) uint {
-	result := sess.Query("Select COUNT(*) FROM "+table+" WHERE "+where, args...)
-	return uint(result.Count())
+
+// Count rows based on condition
+func (sess *Session) CountRows(table, string, where string, args ...interface{}) int {
+	i := new(int)
+	sess.GetVar(i, "Select COUNT(*) FROM "+table+" WHERE "+where, args...)
+	return *i
+}
+func (sess *Session) GetVar(v interface{}, query string, args ...interface{}) {
+	onGoing := sess.StartQuery(query, args...)
+	var first bool
+	onGoing.WithEachRow(func(b [][]byte) {
+		if first {
+			panic("more than one row")
+		}
+		first = true
+		switch v.(type) {
+		case *int:
+			*v.(*int) = toInt(b[0])
+		case *float64:
+			*v.(*float64) = toFloat(b[0])
+		case *uint64:
+			*v.(*uint64) = toBigUint(b[0])
+		case *uint:
+			*v.(*uint) = uint(toBigUint(b[0]))
+		case *string:
+			*v.(*string) = toStr(b[0])
+		case *[]byte:
+			*v.(*[]byte) = make([]byte, len(b[0]))
+			copy(*v.(*[]byte), b[0])
+		default:
+			panic("unkown data type")
+		}
+		return
+	}, false)
+}
+func toInt(b []byte) (i int) {
+	i, _ = strconv.Atoi(string(b))
+	return
+}
+func toFloat(b []byte) (f float64) {
+	f, _ = strconv.ParseFloat(string(b), 64)
+	return
+}
+func toBigUint(b []byte) (u uint64) {
+	u, _ = strconv.ParseUint(string(b), 10, 64)
+	return
+}
+func toStr(b []byte) string {
+	return string(b)
 }
 
 type DebugQuery struct {
 	Query   string
-	Time    string
 	Explain Result
 }
 
@@ -236,30 +295,15 @@ func (deb *DebugQuery) String() string {
 	} else {
 		explain = deb.Explain.String()
 	}
-	return fmt.Sprintf("Time: %s\nQuery: %s\nExplain:\n%s\n", deb.Time, deb.Query, explain)
+	return fmt.Sprintf("Query: %s\nExplain:\n%s\n", deb.Query, explain)
 }
 
-var debugTemp = myhtml.ParseTemp(
-	`<div style="background:black;color:white;padding:5px;margin:10px 0">` +
-		`Time: <span style="color:yellow">{%v}</span><br>` +
-		`Query:<pre style="background:white;color:yellow;padding:10px">{%s}</pre>` +
-		`Explain:{%v}` +
-		`</div>`,
-)
-
-func (deb *DebugQuery) Html() string {
-
-	var explain string
-	if deb.Explain.Count() == 0 {
-		explain = "No Explain"
-	} else {
-		explain = deb.Explain.Html()
-	}
-	return debugTemp.Exec(deb.Time, deb.Query, explain)
-}
 func (sess *Session) DebugLast() DebugQuery {
-
-	query := misc.TrimLines(sess.LastQuery, false)
+	lines := bytes.Split(sess.LastQuery, []byte{'\n'})
+	for i := range lines {
+		lines[i] = bytes.Trim(lines[i], "\n\t\r ")
+	}
+	query := bytes.Join(lines, []byte{'\n'})
 	debug := DebugQuery{
 		Query: string(query),
 	}
@@ -270,16 +314,16 @@ func (sess *Session) DebugLast() DebugQuery {
 	if len(query) < 6 {
 		return debug
 	}
-	comm := misc.ToLowerCase(string(query[:6]))
-	switch comm {
+	switch string(bytes.ToLower(query[:6])) {
 	case "select", "update", "insert", "delete":
 		debug.Explain = sess.Query("EXPLAIN " + debug.Query)
-
 	}
 	return debug
 }
 
+// get only one row, panic if more than one row
 func (sess *Session) QueryOne(query string, args ...interface{}) (ok bool, row Row) {
+
 	res := sess.Query(query, args...)
 	if res.Count() > 1 {
 		panic("returning more than one row for your query: " + query)
@@ -290,20 +334,21 @@ func (sess *Session) QueryOne(query string, args ...interface{}) (ok bool, row R
 	return true, res.GetRow(0)
 }
 
-type colType byte
+type ColType byte
 
 const (
-	colTypeInt colType = iota
-	colTypeBigUInt
-	colTypeFloat
-	colTypeStr
+	ColTypeInt ColType = iota
+	ColTypeBigUInt
+	ColTypeFloat
+	// str is actually byte slice of non numeric types
+	ColTypeStr
 	// colTypeAny
 )
 
 type Result struct {
 	Cols  map[string]uint
 	Data  [][][]byte // int or string
-	types []colType
+	types []ColType
 }
 type Row struct {
 	Result Result
@@ -348,7 +393,7 @@ func (res Result) Html() string {
 	w.WriteString(`<table class="dbresult"><tr>`)
 	for _, col := range res.ColsSlice() {
 		w.WriteString(`<th>`)
-		myhtml.EscapeTo(&w, col)
+		w.WriteString(html.EscapeString(string(col)))
 		w.WriteString(`</th>`)
 	}
 	w.WriteString("</tr>")
@@ -356,7 +401,7 @@ func (res Result) Html() string {
 		w.WriteString(`<tr>`)
 		for _, data := range row {
 			w.WriteString(`<td>`)
-			w.WriteString(misc.ToStr(data))
+			w.WriteString(html.EscapeString(string(data)))
 			w.WriteString(`</td>`)
 		}
 		w.WriteString(`</tr>`)
@@ -373,50 +418,40 @@ func (row Row) Get(col string) (uint, []byte) {
 }
 func (row Row) Int(col string) int {
 	_, val := row.Get(col)
-	return misc.StrToInt(misc.UnsafeToStr(val))
+	i, _ := strconv.Atoi(string(val))
+	return i
 }
 func (row Row) Float(col string) float64 {
 	_, val := row.Get(col)
-	return misc.StrToFloat(misc.UnsafeToStr(val))
+	f, _ := strconv.ParseFloat(string(val), 64)
+	return f
 }
-func (row Row) BigUint(col string) uint {
+func (row Row) BigUint(col string) uint64 {
 	_, val := row.Get(col)
-	return misc.StrToUint(misc.UnsafeToStr(val))
+	u, _ := strconv.ParseUint(string(val), 10, 64)
+	return u
 }
 func (row Row) Str(col string) string {
 	_, val := row.Get(col)
-	return misc.UnsafeToStr(val)
+	return string(val)
 }
 func (row Row) Bytes(col string) []byte {
 	_, val := row.Get(col)
 	return val
 }
-func (row *Row) Set(col string, value interface{}) {
-	b := []byte(misc.ToStr(value))
-	i, ok := row.Result.Cols[col]
-	r := row.Result
-	if !ok {
-		r.Data[row.i] = append(r.Data[row.i], b)
-		i = uint(len(r.Data[row.i])) - 1
-		r.Cols[col] = i
-		row.Result.types[i] = colTypeStr
-		return
-	}
-	r.Data[row.i][i] = b
-}
 func (row Row) ToMap() map[string]interface{} {
 	m := make(map[string]interface{}, row.Result.Count())
 	for key, i := range row.Result.Cols {
-		val := row.Result.Data[row.i][i]
+		// val := row.Result.Data[row.i][i]
 		switch row.Result.types[i] {
-		case colTypeInt:
-			m[key] = misc.ToInt(val)
-		case colTypeBigUInt:
-			m[key] = misc.ToUint(val)
-		case colTypeFloat:
-			m[key] = misc.ToFloat(val)
+		case ColTypeInt:
+			m[key] = row.Int(key)
+		case ColTypeBigUInt:
+			m[key] = row.BigUint(key)
+		case ColTypeFloat:
+			m[key] = row.Float(key)
 		default:
-			m[key] = misc.ToStr(val)
+			m[key] = row.Str(key)
 		}
 	}
 	return m
@@ -440,207 +475,121 @@ func (sess *Session) Exec(query string, args ...interface{}) OkPacket {
 }
 
 type ColumnInfo struct {
-	Type colType
+	Type ColType
 	name []byte
 }
-
-type QueryInfo struct {
-	Query     string
-	Args      []interface{}
-	ColNumber func(int)
-	EachCol   func(ColumnInfo)
-	EachRow   func([][]byte)
-	Now       time.Time
+type OnGoingQuery struct {
+	*Session
+	ColNum  uint
+	gotCols bool
 }
 
-func (sess *Session) DoQuery(info QueryInfo) (ok OkPacket, dur time.Duration) {
-	b, isOk := sess.query(info.Query, info.Args)
-	if !info.Now.IsZero() {
-		dur = sess.LastQueryTime.Sub(info.Now)
+func (onGoing *OnGoingQuery) WithEachCol(each func(colName []byte, colType ColType)) {
+
+	if onGoing.gotCols {
+		panic("already called")
 	}
-	if isOk {
-		ok = parseOk(b)
-		return
+	if !onGoing.onGoingQuery {
+		panic("no onGoing query")
 	}
-	_, colNum := calcLenEncInt(b)
-	var colInfo ColumnInfo
+	onGoing.gotCols = true
+	var colName []byte
 	var t byte
+	var colType ColType
 	var flags uint
-	for i := uint(0); i < colNum; i++ {
-		b, _ = sess.readPayload()
-		b, _ = readLenEncStr(b)            // catalog
-		b, _ = readLenEncStr(b)            // schema
-		b, _ = readLenEncStr(b)            // table
-		b, _ = readLenEncStr(b)            // org_table
-		b, colInfo.name = readLenEncStr(b) // name
-		b, _ = readLenEncStr(b)            // org_name
-		b, _ = calcLenEncInt(b)            // length of fixed length fields
-		b = b[2:]                          // b, _ = readBytes(b, 2)    // character_set
-		b = b[4:]                          // b, _ = readBytes(b, 4)    // column_length
-		// b=b[1:]                // type
-		// b=b[2:] // flags
-		t = b[0]
+	var b []byte
+	for i := uint(0); i < onGoing.ColNum; i++ {
+		b, _ = onGoing.readPayload()
+		if each == nil {
+			continue
+		}
+		b, _ = readLenEncStr(b)       // catalog
+		b, _ = readLenEncStr(b)       // schema
+		b, _ = readLenEncStr(b)       // table
+		b, _ = readLenEncStr(b)       // org_table
+		b, colName = readLenEncStr(b) // name
+		b, _ = readLenEncStr(b)       // org_name
+		b, _ = calcLenEncInt(b)       // length of fixed length fields
+		b = b[2:]                     // b, _ = readBytes(b, 2)    // character_set
+		b = b[4:]                     // b, _ = readBytes(b, 4)    // column_length
+		t = b[0]                      // type
 		b = b[1:]
 		flags = calcInt(b[:2]) // such as unsigned or nullable
 		switch t {
 		case mYSQL_TYPE_LONGLONG:
 
 			if flags&32 > 0 {
-				colInfo.Type = colTypeBigUInt
+				colType = ColTypeBigUInt
 			} else {
-				colInfo.Type = colTypeInt
+				colType = ColTypeInt
 			}
 		case /*int*/ mYSQL_TYPE_TINY, mYSQL_TYPE_SHORT, mYSQL_TYPE_LONG, mYSQL_TYPE_INT24, mYSQL_TYPE_YEAR, mYSQL_TYPE_BOOL:
-			colInfo.Type = colTypeInt
+			colType = ColTypeInt
 		case /*float*/ mYSQL_TYPE_FLOAT, mYSQL_TYPE_DOUBLE, mYSQL_TYPE_DECIMAL, mYSQL_TYPE_NEWDECIMAL:
-			colInfo.Type = colTypeFloat
+			colType = ColTypeFloat
 		default:
-			colInfo.Type = colTypeStr
+			colType = ColTypeStr
 		}
-		if info.EachCol != nil {
-			info.EachCol(colInfo)
-		}
+		each(colName, colType)
 	}
-	var data = make([][]byte, colNum)
-	for {
-		b, _ = sess.readPayload()
-		ErrOrOk(b)
-		if isEof(b) {
-			break
-		}
-		// var neg int
-		for i := uint(0); i < colNum; i++ {
+}
+func (onGoing *OnGoingQuery) WithEachRow(each func(data [][]byte), copyBuffer bool) {
+	if !onGoing.gotCols {
+		onGoing.WithEachCol(nil)
+	}
+	var data = make([][]byte, onGoing.ColNum)
 
-			if b[0] == 0xFB {
-				data[i] = nil
-				b = b[1:]
-				continue
-			}
-			b, data[i] = readLenEncStr(b)
-		}
-		info.EachRow(data)
+	b, _ := onGoing.readPayload()
+	if copyBuffer {
+		bb := make([]byte, len(b))
+		copy(bb, b)
+		b = bb
 	}
+	ErrOrOk(b)
+	if isEof(b) {
+		onGoing.onGoingQuery = false
+		onGoing.Session = nil
+		return
+	}
+	for i := range data {
+		if b[0] == 0xFB {
+			b = b[1:]
+			continue
+		}
+		b, data[i] = readLenEncStr(b)
+	}
+	each(data)
+}
+func (sess *Session) StartQuery(query string, args ...interface{}) (onGoing OnGoingQuery) {
+
+	if sess.onGoingQuery {
+		panic("You have not fetch last Query data")
+	}
+	b, isOk := sess.query(query, args)
+
+	if isOk {
+		return
+	}
+	_, onGoing.ColNum = calcLenEncInt(b)
+	sess.onGoingQuery = true
 	return
 }
 
 func (sess *Session) Query(query string, args ...interface{}) (res Result) {
-	cols
-	sess.DoQuery(QueryInfo{
-		Query: query,
-		Args:  args,
+	onGoing := sess.StartQuery(query, args...)
+	res = Result{
+		Cols:  make(map[string]uint, onGoing.ColNum),
+		types: make([]ColType, onGoing.ColNum),
+	}
+	i := uint(0)
+	onGoing.WithEachCol(func(colName []byte, colType ColType) {
+		res.types[i] = colType
+		res.Cols[string(colName)] = i
+		i++
 	})
-
-	b, isOk := sess.query(query, args)
-	if isOk {
-		return
-	}
-	res = Result{}
-	_, colNum := calcLenEncInt(b)
-	res.Cols = make(map[string]uint, colNum)
-	var str []byte
-	var t byte
-	var flags uint
-	res.types = make([]colType, colNum)
-	var bCopy []byte
-	for i := uint(0); i < colNum; i++ {
-		b, _ = sess.readPayload()
-		b, _ = readLenEncStr(b)   // catalog
-		b, _ = readLenEncStr(b)   // schema
-		b, _ = readLenEncStr(b)   // table
-		b, _ = readLenEncStr(b)   // org_table
-		b, str = readLenEncStr(b) // name
-		b, _ = readLenEncStr(b)   // org_name
-		b, _ = calcLenEncInt(b)   // length of fixed length fields
-		b = b[2:]                 // b, _ = readBytes(b, 2)    // character_set
-		b = b[4:]                 // b, _ = readBytes(b, 4)    // column_length
-		// b=b[1:]                // type
-		// b=b[2:] // flags
-		t = b[0]
-		b = b[1:]
-		flags = calcInt(b[:2]) // such as unsigned or nullable
-		switch t {
-		case mYSQL_TYPE_LONGLONG:
-
-			if flags&32 > 0 {
-				res.types[i] = colTypeBigUInt
-			} else {
-				res.types[i] = colTypeInt
-			}
-		case /*int*/ mYSQL_TYPE_TINY, mYSQL_TYPE_SHORT, mYSQL_TYPE_LONG, mYSQL_TYPE_INT24, mYSQL_TYPE_YEAR, mYSQL_TYPE_BOOL:
-			res.types[i] = colTypeInt
-		case /*float*/ mYSQL_TYPE_FLOAT, mYSQL_TYPE_DOUBLE, mYSQL_TYPE_DECIMAL, mYSQL_TYPE_NEWDECIMAL:
-			res.types[i] = colTypeFloat
-		default:
-			res.types[i] = colTypeStr
-		}
-		res.Cols[string(str)] = i
-	}
-	// get rows
-	var data [][]byte
-	for {
-		b, _ = sess.readPayload()
-		ErrOrOk(b)
-		if isEof(b) {
-			break
-		}
-
-		bCopy = make([]byte, len(b))
-		copy(bCopy, b)
-
-		data = make([][]byte, colNum)
-		// var neg int
-		for i := uint(0); i < colNum; i++ {
-
-			if bCopy[0] == 0xFB {
-				data[i] = nil
-				bCopy = bCopy[1:]
-				// switch types[i] {
-				// case colTypeInt:
-				// 	data[i] = 0
-				// case colTypeBigUInt:
-				// 	data[i] = uint(0)
-				// case colTypeFloat:
-				// 	data[i] = float64(0)
-				// default:
-				// 	data[i] = ""
-				// }
-				continue
-			}
-			bCopy, str = readLenEncStr(bCopy)
-			// bCopy = append(bCopy, str...)
-
-			data[i] = str
-			// switch res.types[i] {
-			// case colTypeInt:
-			// 	if len(str) == 1 {
-			// 		data[i] = str[0] - '0'
-			// 		break
-			// 	}
-			// 	neg = 1
-			// 	if str[0] == '-' {
-			// 		neg = -1
-			// 		str = str[1:]
-			// 	}
-			// 	n := 0
-			// 	for _, c := range str {
-			// 		n = n*10 + int(c-'0')
-			// 	}
-			// 	n *= neg
-			// 	data[i] = n
-			// case colTypeBigUInt:
-			// 	n := uint(0)
-			// 	for _, c := range str {
-			// 		n = n*10 + uint(c-'0')
-			// 	}
-			// 	data[i] = n
-			// case colTypeFloat:
-			// 	data[i], _ = strconv.ParseFloat(string(str), 64)
-			// default:
-			// 	data[i] = string(str)
-			// }
-		}
-		res.Data = append(res.Data, data)
-	}
+	onGoing.WithEachRow(func(b [][]byte) {
+		res.Data = append(res.Data, b)
+	}, true)
 	return
 }
 
@@ -774,7 +723,7 @@ func escapeargTo(sess *Session, arg interface{}) {
 
 func readLenEncStr(b []byte) (newB []byte, str []byte) {
 	newB, l := calcLenEncInt(b)
-	newB, str = readBytes(newB, l)
+	newB, str = readBytes(newB, int(l))
 	return
 }
 
@@ -869,19 +818,18 @@ func calcLenEncInt(b []byte) (newB []byte, i uint) {
 	panic("protocol err ? ")
 }
 
-func readBytes(b []byte, n uint) (newb []byte, read []byte) {
-	newb, read = misc.Read(b, int(n))
-	if read == nil {
+func readBytes(b []byte, n int) (newb []byte, read []byte) {
+	if len(b) < n {
 		panic("not enough bytes to read")
 	}
-	return
+	return b[n:], b[:n]
 }
 func readUntil(b []byte, c byte) (newb []byte, read []byte) {
-	newb, read = misc.ReadUntil(b, c)
-	if read == nil {
+	i := bytes.IndexByte(b, c)
+	if i == -1 {
 		panic("did not found c")
 	}
-	return
+	return b[i+1:], b[:i+1]
 }
 
 // func readPayload(sess *Session) (b []byte, lastSeqId byte) {
@@ -1157,8 +1105,9 @@ func (sess *Session) sendPayload(secId byte) {
 	}
 	var part []byte
 	for i := secId; b != nil; i++ {
-		b, part = misc.Read(b, packetSize)
-		if part == nil {
+		if len(b) >= packetSize {
+			b, part = readBytes(b, packetSize)
+		} else {
 			part = b
 			b = nil
 		}
